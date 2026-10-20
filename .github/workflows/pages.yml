@@ -1,0 +1,103 @@
+name: Publish course materials
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+concurrency:
+  group: pages
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Download and verify material originals
+        run: |
+          python - <<'PY'
+          """Build a verified static copy of the public course-material release."""
+          from concurrent.futures import ThreadPoolExecutor
+          import hashlib
+          from html import escape
+          import json
+          from pathlib import Path
+          import re
+          import time
+          from urllib.request import urlopen
+
+          RELEASE = 'https://github.com/ZJUSUEE/ZJUSUEE.github.io/releases/download/learning-materials-2026-10-15/'
+          LIMIT = 750_000_000
+
+
+          def validate(records):
+              names = set()
+              for item in records:
+                  name = item['name']
+                  if (not re.fullmatch(r'(?:material-[a-f0-9]{64}|boiler-review-notes-klx)\.(?:pdf|docx?)', name)
+                          or name in names or not re.fullmatch(r'[a-f0-9]{64}', item['sha256'])
+                          or type(item['size']) is not int or item['size'] < 1
+                          or item['url'] != RELEASE + name):
+                      raise ValueError(f'Invalid or repeated material: {name}')
+                  names.add(name)
+              if not records or sum(item['size'] for item in records) > LIMIT:
+                  raise ValueError('Empty inventory or material budget exceeded')
+
+
+          def download(item, folder):
+              target = folder / item['name']
+              temporary = target.with_suffix(target.suffix + '.part')
+              for attempt in range(3):
+                  try:
+                      digest, size = hashlib.sha256(), 0
+                      with urlopen(item['url'], timeout=60) as response, temporary.open('wb') as output:
+                          while block := response.read(1024 * 1024):
+                              size += len(block)
+                              if size > item['size']:
+                                  raise ValueError('Downloaded file is larger than inventory')
+                              digest.update(block)
+                              output.write(block)
+                      if (size, digest.hexdigest()) != (item['size'], item['sha256']):
+                          raise ValueError('Downloaded file does not match size and SHA-256')
+                      temporary.replace(target)
+                      return
+                  except Exception:
+                      temporary.unlink(missing_ok=True)
+                      if attempt == 2:
+                          raise
+                      time.sleep(2 ** attempt)
+
+
+          def build(records, title, folder=Path('_site')):
+              validate(records)
+              folder.mkdir(parents=True, exist_ok=True)
+              if any(folder.iterdir()):
+                  raise ValueError('Build output must be empty')
+              with ThreadPoolExecutor(max_workers=4) as pool:
+                  list(pool.map(lambda item: download(item, folder), records))
+              (folder / 'manifest.json').write_text(json.dumps(records, ensure_ascii=False, indent=2))
+              links = ''.join(f'<li><a href="{item["name"]}">{escape(Path(item["path"]).name)}</a></li>' for item in records)
+              (folder / 'index.html').write_text('<!doctype html><html lang="zh-CN"><meta charset="utf-8">'
+                  '<meta name="viewport" content="width=device-width,initial-scale=1">'
+                  f'<title>{escape(title)} · 源梦紫金</title><h1>{escape(title)}</h1>'
+                  '<p><a href="https://zjusuee.github.io/">返回源梦紫金</a></p><ul>' + links + '</ul></html>')
+              if sum(path.stat().st_size for path in folder.iterdir()) > LIMIT:
+                  raise ValueError('Published site budget exceeded')
+
+          records = json.loads('[{"path": "courses/routes/Thermal/Route/能源转化（锅炉原理）/热能锅炉原理复习笔记.-klx.pdf", "name": "boiler-review-notes-klx.pdf", "sha256": "507eb96f7afb419db4541a771c2f53ad936b28a9e276e427f7c8fefe1c8e18d2", "size": 133976746, "url": "https://github.com/ZJUSUEE/ZJUSUEE.github.io/releases/download/learning-materials-2026-10-15/boiler-review-notes-klx.pdf"}]')
+          build(records, '专业课资料')
+          PY
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+      - uses: actions/deploy-pages@v4
+        id: deployment
